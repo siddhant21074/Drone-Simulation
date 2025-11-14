@@ -1,0 +1,113 @@
+<mujoco model="quadcopter_drone">
+  <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+  
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4">
+    <flag warmstart="enable"/>
+  </option>
+
+  <visual>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <quality shadowsize="2048"/>
+    <map stiffness="700"/>
+  </visual>
+
+  <asset>
+    <!-- Textures for environment -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0.1 0.2 0.3" width="512" height="512"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.3 0.2" rgb2="0.3 0.4 0.3" width="512" height="512" mark="edge" markrgb="0.2 0.3 0.2"/>
+    <texture name="grass" type="2d" builtin="flat" rgb1="0.3 0.5 0.3" width="512" height="512"/>
+    
+    <material name="grid" texture="grid" texrepeat="10 10" texuniform="true" reflectance="0.1"/>
+    <material name="grass" texture="grass" texrepeat="20 20"/>
+    <material name="drone_body" rgba="0.2 0.2 0.2 1" specular="0.5" shininess="0.3"/>
+    <material name="drone_arm" rgba="0.8 0.1 0.1 1" specular="0.3" shininess="0.1"/>
+    <material name="rotor" rgba="0.1 0.1 0.1 0.7" specular="0.8" shininess="0.5"/>
+  </asset>
+
+  <worldbody>
+    <!-- Lighting -->
+    <light directional="true" pos="0 0 10" dir="0 0 -1" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+    <light directional="true" pos="5 5 10" dir="-1 -1 -2" diffuse="0.4 0.4 0.5"/>
+    
+    <!-- Ground plane -->
+    <geom name="floor" type="plane" size="50 50 0.1" material="grid" condim="3" friction="1 0.5 0.005"/>
+    
+    <!-- Environment obstacles/landmarks -->
+    <body name="tree1" pos="3 2 0">
+      <geom type="cylinder" size="0.15 1.5" rgba="0.4 0.3 0.2 1" mass="0"/>
+      <geom type="sphere" size="0.8" pos="0 0 2" rgba="0.2 0.6 0.3 1" mass="0"/>
+    </body>
+    
+    <body name="tree2" pos="-4 3 0">
+      <geom type="cylinder" size="0.2 2" rgba="0.4 0.3 0.2 1" mass="0"/>
+      <geom type="sphere" size="1" pos="0 0 2.5" rgba="0.2 0.6 0.3 1" mass="0"/>
+    </body>
+    
+    <body name="building" pos="6 -4 0">
+      <geom type="box" size="1.5 1.5 3" rgba="0.6 0.6 0.7 1" mass="0"/>
+    </body>
+
+    <!-- Drone body -->
+    <body name="drone" pos="0 0 1.5">
+      <!-- Central body -->
+      <freejoint name="drone_joint"/>
+      <geom name="body_center" type="box" size="0.08 0.08 0.03" mass="0.4" material="drone_body"/>
+      
+      <!-- Camera mount (front indicator) -->
+      <geom name="camera" type="cylinder" size="0.02 0.015" pos="0.09 0 0" quat="0.707 0 0.707 0" rgba="0.1 0.1 0.8 1" mass="0.05"/>
+      
+      <!-- Arms with motors -->
+      <!-- Front-right arm -->
+      <body name="arm1" pos="0.12 0.12 0">
+        <geom name="arm1_geom" type="capsule" fromto="0 0 0 -0.12 -0.12 0" size="0.015" material="drone_arm" mass="0.08"/>
+        <geom name="motor1" type="cylinder" size="0.025 0.015" pos="0 0 0" rgba="0.3 0.3 0.3 1" mass="0.05"/>
+        <geom name="rotor1_geom" type="cylinder" size="0.1 0.002" pos="0 0 0.02" rgba="0.1 0.1 0.1 0.5" mass="0.02"/>
+        <site name="rotor1" pos="0 0 0.02" size="0.01"/>
+      </body>
+      
+      <!-- Front-left arm -->
+      <body name="arm2" pos="-0.12 0.12 0">
+        <geom name="arm2_geom" type="capsule" fromto="0 0 0 0.12 -0.12 0" size="0.015" material="drone_arm" mass="0.08"/>
+        <geom name="motor2" type="cylinder" size="0.025 0.015" pos="0 0 0" rgba="0.3 0.3 0.3 1" mass="0.05"/>
+        <geom name="rotor2_geom" type="cylinder" size="0.1 0.002" pos="0 0 0.02" rgba="0.1 0.1 0.1 0.5" mass="0.02"/>
+        <site name="rotor2" pos="0 0 0.02" size="0.01"/>
+      </body>
+      
+      <!-- Back-left arm -->
+      <body name="arm3" pos="-0.12 -0.12 0">
+        <geom name="arm3_geom" type="capsule" fromto="0 0 0 0.12 0.12 0" size="0.015" material="drone_arm" mass="0.08"/>
+        <geom name="motor3" type="cylinder" size="0.025 0.015" pos="0 0 0" rgba="0.3 0.3 0.3 1" mass="0.05"/>
+        <geom name="rotor3_geom" type="cylinder" size="0.1 0.002" pos="0 0 0.02" rgba="0.1 0.1 0.1 0.5" mass="0.02"/>
+        <site name="rotor3" pos="0 0 0.02" size="0.01"/>
+      </body>
+      
+      <!-- Back-right arm -->
+      <body name="arm4" pos="0.12 -0.12 0">
+        <geom name="arm4_geom" type="capsule" fromto="0 0 0 -0.12 0.12 0" size="0.015" material="drone_arm" mass="0.08"/>
+        <geom name="motor4" type="cylinder" size="0.025 0.015" pos="0 0 0" rgba="0.3 0.3 0.3 1" mass="0.05"/>
+        <geom name="rotor4_geom" type="cylinder" size="0.1 0.002" pos="0 0 0.02" rgba="0.1 0.1 0.1 0.5" mass="0.02"/>
+        <site name="rotor4" pos="0 0 0.02" size="0.01"/>
+      </body>
+      
+      <!-- Landing gear -->
+      <geom name="leg1" type="capsule" fromto="0.08 0.08 -0.03 0.08 0.08 -0.15" size="0.008" rgba="0.2 0.2 0.2 1" mass="0.02"/>
+      <geom name="leg2" type="capsule" fromto="-0.08 0.08 -0.03 -0.08 0.08 -0.15" size="0.008" rgba="0.2 0.2 0.2 1" mass="0.02"/>
+      <geom name="leg3" type="capsule" fromto="-0.08 -0.08 -0.03 -0.08 -0.08 -0.15" size="0.008" rgba="0.2 0.2 0.2 1" mass="0.02"/>
+      <geom name="leg4" type="capsule" fromto="0.08 -0.08 -0.03 0.08 -0.08 -0.15" size="0.008" rgba="0.2 0.2 0.2 1" mass="0.02"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <!-- Position sensors -->
+    <framepos name="drone_position" objtype="body" objname="drone"/>
+    <framequat name="drone_orientation" objtype="body" objname="drone"/>
+    
+    <!-- Velocity sensors -->
+    <framelinvel name="drone_linvel" objtype="body" objname="drone"/>
+    <frameangvel name="drone_angvel" objtype="body" objname="drone"/>
+    
+    <!-- Accelerometer and gyroscope -->
+    <accelerometer name="accel" site="rotor1"/>
+    <gyro name="gyro" site="rotor1"/>
+  </sensor>
+</mujoco>
