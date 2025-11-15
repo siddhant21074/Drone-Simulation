@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🚁 Drone Simulation Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <style>
+        body {
+            background: linear-gradient(180deg, #0d2b39, #355564);
+            padding: 25px;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        h1 {
+            text-align: center;
+            color: white;
+            font-weight: 700;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(8px);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.15);
+        }
+
+        #output {
+            height: 260px;
+            overflow-y: auto;
+            background: rgba(0,0,0,0.6);
+            color: #00ffea;
+            padding: 15px;
+            border-radius: 10px;
+            font-family: monospace;
+            margin-top: 15px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+
+        #viewer-container {
+            width: 100%;
+            height: 500px;
+            border-radius: 12px;
+            overflow: hidden;
+            background: black;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>🚁 Drone Simulation Dashboard</h1>
+
+    <!-- 3D Viewer Card -->
+    <div class="card mb-4">
+        <h4 class="text-white mb-3">📦 3D Drone Preview</h4>
+
+        <!-- Sketchfab Embed Viewer -->
+        <div id="viewer-container">
+            <iframe 
+                title="Drone 3D Model"
+                frameborder="0" 
+                allowfullscreen 
+                mozallowfullscreen="true" 
+                webkitallowfullscreen="true"
+                allow="autoplay; fullscreen; xr-spatial-tracking; gyroscope; accelerometer"
+                src="https://sketchfab.com/models/2c180e2a026c4cda8a4b4e019f5037b3/embed?autostart=1&internal=1&tracking=0&ui_ar=0&ui_infos=0&ui_snapshots=1&ui_stop=0&ui_theatre=1&ui_watermark=0"
+                style="width: 100%; height: 100%; border: none;">
+            </iframe>
+        </div>
+    </div>
+
+    <!-- Simulation Controls Card -->
+    <div class="card">
+        <h4 class="text-white mb-3">⚙ Simulation Controls</h4>
+
+        <button id="startBtn" class="btn btn-success">▶ Start</button>
+        <button id="stopBtn" class="btn btn-danger" disabled>⏹ Stop</button>
+
+        <div id="output"></div>
+    </div>
+
+    <!-- Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
+
+    <script>
+        const socket = io();
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
+        const outputDiv = document.getElementById("output");
+
+        socket.on("connect", () => {
+            appendOutput("Connected to server");
+        });
+
+        startBtn.addEventListener("click", () => {
+            socket.emit("start_simulation");
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            appendOutput("Starting simulation...");
+        });
+
+        stopBtn.addEventListener("click", () => {
+            socket.emit("stop_simulation");
+            stopBtn.disabled = true;
+            appendOutput("Stopping simulation...");
+        });
+
+        socket.on("simulation_status", (data) => {
+            appendOutput("Status: " + data.status);
+            if (data.status === "stopped") {
+                startBtn.disabled = false;
+            }
+        });
+
+        socket.on("simulation_output", (data) => {
+            appendOutput(data.data);
+        });
+
+        function appendOutput(text) {
+            const line = document.createElement("div");
+            line.textContent = text;
+            outputDiv.appendChild(line);
+            outputDiv.scrollTop = outputDiv.scrollHeight;
+        }
+    </script>
+
+</body>
+</html>

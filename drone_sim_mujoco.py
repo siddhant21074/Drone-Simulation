@@ -1,633 +1,610 @@
+# drone_sim_mujoco.py
+# 3D Drone Simulation with orbit camera (Option B), smooth controls, HUD, custom OBJ rendering.
+# Expects Models/completo.obj in the project folder.
+
+import os
+import sys
+import math
+import time
+import numpy as np
 import pygame
 from pygame.locals import *
 from OpenGL.GL import *
 from OpenGL.GLU import *
-import numpy as np
-import sys
+from PIL import Image
 
-# ---------------------
-# Drone & env constants
-# ---------------------
+# -------------------- Configuration --------------------
+MODEL_PATH = os.path.join("Models", "drone_costum.obj")
+
+DISPLAY = (1280, 800)
+FPS_TARGET = 60
+
+# Physics
 GRAVITY = -9.81
-DRONE_MASS = 1.5
-ARM_LENGTH = 0.18
-MAX_THRUST_PER_ROTOR = 10.0
-TIME_STEP = 1/60.0
+DRONE_MASS = 1.6
+TIME_STEP = 1.0 / FPS_TARGET
+MAX_THRUST = 40.0                 # Newtons total (4 rotors combined)
+THROTTLE_STEP = 0.012             # per frame throttle change when key pressed
+THROTTLE_DECAY = 0.995           # small decay when not pressing
+MAX_ALT_RATE = 6.0               # m/s vertical speed cap
+LINEAR_DRAG = 0.8                # simple air drag multiplier per second
+ANGULAR_DAMPING = 0.92
 
-BATTERY_CAPACITY_AH = 2.2
-BATTERY_VOLTAGE = 11.1
-BATTERY_WH = BATTERY_CAPACITY_AH * BATTERY_VOLTAGE
-POWER_COEFF = 0.5
-THROTTLE_STEP = 0.03
-CONTROL_ROLL_GAIN = 3.5
-CONTROL_PITCH_GAIN = 3.5
-CONTROL_YAW_GAIN = 1.2
-UNLIMITED_BATTERY = True
-DEFAULT_WIND = np.array([0.0, 0.0, 0.0])
-MAX_WIND_SPEED = 15.0
-WIND_STEP = 0.4
+# Control gains (tuned for stable, smooth feel)
+ROLL_RATE = 60.0                 # degrees/sec per roll input
+PITCH_RATE = 60.0
+YAW_RATE = 90.0
 
-# Camera controls
-camera_distance = 8.0
-camera_angle_x = 30.0
-camera_angle_y = 45.0
-camera_follow = True
+# Camera (orbit)
+CAM_MIN_DIST = 3.0
+CAM_MAX_DIST = 60.0
+CAM_DEFAULT_DIST = 10.0
+CAM_SENS_X = 0.25                 # orbit sensitivity
+CAM_SENS_Y = 0.25
+CAM_MIN_PITCH = -85.0
+CAM_MAX_PITCH = 85.0
 
-# ---------------------
-# Climate model
-# ---------------------
-def compute_wind_force(velocity, wind_vector, drag_coeff=1.05, area=0.1, air_density=1.225):
-    rel = wind_vector - velocity
-    speed = np.linalg.norm(rel)
-    if speed <= 1e-6:
-        return np.zeros(3)
-    drag_mag = 0.5 * air_density * speed**2 * drag_coeff * area
-    drag_dir = -rel / (speed + 1e-12)
-    return drag_mag * drag_dir
+# HUD
+HUD_BG_ALPHA = 180
 
-# ---------------------
-# Drone class (3D)
-# ---------------------
+# Misc
+AUTO_SCALE_FACTOR = 0.9          # final visual tuning for model scale
+
+# -------------------- Robust OBJ loader (center + normalize + display list) --------------------
+class SimpleOBJ:
+    def __init__(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        self.vertices = []
+        self.faces = []
+        self.display_list = None
+        # load
+        self._load_obj(path)
+        if len(self.vertices) == 0:
+            raise ValueError("OBJ has no vertices")
+        self._center_and_normalize()
+        self._create_display_list()
+
+    def _load_obj(self, path):
+        with open(path, "r", errors="ignore") as f:
+            for line in f:
+                if line.startswith("v "):
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        self.vertices.append((x, y, z))
+                elif line.startswith("f "):
+                    parts = line.strip().split()[1:]
+                    face = []
+                    for p in parts:
+                        if p == '':
+                            continue
+                        v = p.split('/')[0]
+                        try:
+                            idx = int(v) - 1
+                        except:
+                            idx = None
+                        face.append(idx)
+                    if len(face) >= 3:
+                        self.faces.append(face)
+        # debug
+        print(f"[OBJ] loaded {len(self.vertices)} vertices, {len(self.faces)} faces from {path}")
+
+    def _center_and_normalize(self):
+        v = np.array(self.vertices, dtype=np.float64)
+        min_v = v.min(axis=0)
+        max_v = v.max(axis=0)
+        center = (min_v + max_v) / 2.0
+        v = v - center
+        max_dim = (max_v - min_v).max()
+        if max_dim <= 0:
+            scale = 1.0
+        else:
+            scale = (1.0 / max_dim) * AUTO_SCALE_FACTOR
+        v = v * scale
+        self.vertices = [tuple(x) for x in v]
+        self.bbox = (min_v, max_v)
+        # debug
+        print(f"[OBJ] centered and scaled (scale={scale:.5f})")
+
+    def _create_display_list(self):
+        # Precompile triangles into display list for speed
+        try:
+            if self.display_list:
+                glDeleteLists(self.display_list, 1)
+        except Exception:
+            pass
+        dl = glGenLists(1)
+        glNewList(dl, GL_COMPILE)
+        glBegin(GL_TRIANGLES)
+        for face in self.faces:
+            # fan triangulation
+            for i in range(1, len(face) - 1):
+                tri = (face[0], face[i], face[i + 1])
+                valid = True
+                for vi in tri:
+                    if vi is None or vi < 0 or vi >= len(self.vertices):
+                        valid = False
+                        break
+                if not valid:
+                    continue
+                # optional normal approximations could be added, but OpenGL fixed pipeline shading is ok
+                v0 = np.array(self.vertices[tri[0]], dtype=np.float32)
+                v1 = np.array(self.vertices[tri[1]], dtype=np.float32)
+                v2 = np.array(self.vertices[tri[2]], dtype=np.float32)
+                # compute face normal
+                normal = np.cross(v1 - v0, v2 - v0)
+                if np.linalg.norm(normal) > 1e-8:
+                    normal = normal / np.linalg.norm(normal)
+                    glNormal3f(float(normal[0]), float(normal[1]), float(normal[2]))
+                # vertices
+                glVertex3f(v0[0], v0[1], v0[2])
+                glVertex3f(v1[0], v1[1], v1[2])
+                glVertex3f(v2[0], v2[1], v2[2])
+        glEnd()
+        glEndList()
+        self.display_list = dl
+        print("[OBJ] display list created")
+
+    def draw(self):
+        if self.display_list:
+            glCallList(self.display_list)
+
+# -------------------- Drone dynamics (improved controls & stable motion) --------------------
 class Drone:
     def __init__(self):
-        self.pos = np.array([0.0, 2.0, 0.0])  # x, y(height), z
-        self.vel = np.array([0.0, 0.0, 0.0])
-        self.rotation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw (degrees)
-        self.ang_vel = np.array([0.0, 0.0, 0.0])
-        
-        # Control inputs
-        self.throttle = 0.0
-        self.roll_input = 0.0
-        self.pitch_input = 0.0
-        self.yaw_input = 0.0
-        
-        # Battery
-        self.battery_wh = BATTERY_WH
-        
-        # PID for altitude
-        self.alt_Kp = 8.0
-        self.alt_Kd = 3.0
-        self.prev_alt_err = 0.0
-        
+        # position and orientation
+        self.pos = np.array([0.0, 2.5, 0.0], dtype=np.float64)   # start a bit higher
+        self.vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self.rot = np.array([0.0, 0.0, 0.0], dtype=np.float64)   # roll, yaw, pitch (degrees)
+        self.ang_vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        # controls
+        self.throttle = 0.0   # 0..1
+        self.input_roll = 0.0
+        self.input_pitch = 0.0
+        self.input_yaw = 0.0
+        # misc
         self.sim_time = 0.0
-        
-        # Rotor positions (body frame)
-        self.rotors = [
-            np.array([ARM_LENGTH, 0, ARM_LENGTH]),    # front-right
-            np.array([-ARM_LENGTH, 0, ARM_LENGTH]),   # front-left
-            np.array([-ARM_LENGTH, 0, -ARM_LENGTH]),  # back-left
-            np.array([ARM_LENGTH, 0, -ARM_LENGTH]),   # back-right
-        ]
-        
-    def get_rotation_matrix(self):
-        """Convert roll, pitch, yaw to rotation matrix"""
-        roll, pitch, yaw = np.radians(self.rotation)
-        
-        # Roll (X-axis)
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll), np.cos(roll)]
-        ])
-        
-        # Pitch (Z-axis) 
-        Rz = np.array([
-            [np.cos(pitch), -np.sin(pitch), 0],
-            [np.sin(pitch), np.cos(pitch), 0],
-            [0, 0, 1]
-        ])
-        
-        # Yaw (Y-axis)
-        Ry = np.array([
-            [np.cos(yaw), 0, np.sin(yaw)],
-            [0, 1, 0],
-            [-np.sin(yaw), 0, np.cos(yaw)]
-        ])
-        
-        return Ry @ Rx @ Rz
-        
-    def update(self, dt, wind_vector, gust_enabled=True):
-        # Desired altitude
-        desired_alt = 2.0 + self.throttle * 3.0
-        alt_err = desired_alt - self.pos[1]
-        alt_der = (alt_err - self.prev_alt_err) / dt
-        self.prev_alt_err = alt_err
-        alt_output = self.alt_Kp * alt_err + self.alt_Kd * alt_der
-        
-        # Total thrust
-        total_thrust = np.clip(DRONE_MASS * (9.81 + alt_output), 0, MAX_THRUST_PER_ROTOR * 4)
-        
-        # Distribute thrust with control inputs
-        thrusts = np.ones(4) * (total_thrust / 4.0)
-        
-        # Roll control (tilt left/right)
-        thrusts[0] += self.roll_input * CONTROL_ROLL_GAIN  # front-right
-        thrusts[3] += self.roll_input * CONTROL_ROLL_GAIN  # back-right
-        thrusts[1] -= self.roll_input * CONTROL_ROLL_GAIN  # front-left
-        thrusts[2] -= self.roll_input * CONTROL_ROLL_GAIN  # back-left
-        
-        # Pitch control (tilt forward/back)
-        thrusts[0] += self.pitch_input * CONTROL_PITCH_GAIN  # front-right
-        thrusts[1] += self.pitch_input * CONTROL_PITCH_GAIN  # front-left
-        thrusts[2] -= self.pitch_input * CONTROL_PITCH_GAIN  # back-left
-        thrusts[3] -= self.pitch_input * CONTROL_PITCH_GAIN  # back-right
-        
-        # Yaw control (rotation)
-        thrusts[0] += self.yaw_input * CONTROL_YAW_GAIN
-        thrusts[2] -= self.yaw_input * CONTROL_YAW_GAIN
-        
-        thrusts = np.maximum(thrusts, 0)
-        
-        # Battery model
-        if UNLIMITED_BATTERY:
-            self.battery_wh = BATTERY_WH
-            battery_factor = 1.0
-        else:
-            power_per_rotor = POWER_COEFF * thrusts * np.sqrt(np.maximum(thrusts, 1e-6))
-            total_power = np.sum(power_per_rotor)
-            energy_used_wh = (total_power * dt) / 3600.0
-            self.battery_wh = max(0.0, self.battery_wh - energy_used_wh)
-            battery_factor = self.battery_wh / BATTERY_WH if BATTERY_WH > 0 else 0.0
-        thrusts = thrusts * battery_factor
-        
-        # Wind with gusts
-        wind = wind_vector.copy()
-        if gust_enabled and np.random.rand() < 0.02:
-            gust = np.random.normal(scale=3.0, size=3)
-            wind += gust
-        
-        wind_force = compute_wind_force(self.vel, wind, drag_coeff=1.2, area=0.15)
-        
-        # Get rotation matrix
-        R = self.get_rotation_matrix()
-        
-        # Thrust in body frame (upward)
-        thrust_body = np.array([0, np.sum(thrusts), 0])
-        thrust_world = R @ thrust_body
-        
-        # Net force
-        gravity_force = np.array([0.0, DRONE_MASS * GRAVITY, 0.0])
-        net_force = thrust_world + gravity_force + wind_force
-        
-        # Update dynamics
-        accel = net_force / DRONE_MASS
-        self.vel += accel * dt
+
+    def update(self, dt):
+        # Limit throttle
+        self.throttle = np.clip(self.throttle, 0.0, 1.0)
+        # Total upward thrust (body-up axis)
+        thrust_world = np.array([0.0, self.throttle * MAX_THRUST, 0.0], dtype=np.float64)
+
+        # Orientation: compute rotation matrix from roll, pitch, yaw.
+        roll = math.radians(self.rot[0])
+        yaw = math.radians(self.rot[1])
+        pitch = math.radians(self.rot[2])
+
+        # Build rotation: Yaw (Y), Roll (X), Pitch (Z) as earlier
+        Rx = np.array([[1, 0, 0],
+                       [0, math.cos(roll), -math.sin(roll)],
+                       [0, math.sin(roll), math.cos(roll)]])
+        Rz = np.array([[math.cos(pitch), -math.sin(pitch), 0],
+                       [math.sin(pitch), math.cos(pitch), 0],
+                       [0, 0, 1]])
+        Ry = np.array([[math.cos(yaw), 0, math.sin(yaw)],
+                       [0, 1, 0],
+                       [-math.sin(yaw), 0, math.cos(yaw)]])
+        R = Ry @ Rx @ Rz
+
+        # thrust in world coordinates
+        thrust_world = R @ np.array([0.0, self.throttle * MAX_THRUST, 0.0])
+
+        # gravity
+        gravity = np.array([0.0, DRONE_MASS * GRAVITY, 0.0], dtype=np.float64)
+        # drag
+        drag = -LINEAR_DRAG * self.vel
+
+        # net force
+        net = gravity + thrust_world + drag
+        acc = net / DRONE_MASS
+
+        # integrate linear
+        self.vel += acc * dt
+        # cap vertical speed for predictability
+        if self.vel[1] > MAX_ALT_RATE:
+            self.vel[1] = MAX_ALT_RATE
+        if self.vel[1] < -MAX_ALT_RATE:
+            self.vel[1] = -MAX_ALT_RATE
+
         self.pos += self.vel * dt
-        
-        # Update rotation based on inputs
-        self.rotation[0] += self.roll_input * 30 * dt  # roll
-        self.rotation[2] += self.pitch_input * 30 * dt  # pitch
-        self.rotation[1] += self.yaw_input * 50 * dt  # yaw
-        
-        # Damping
-        self.rotation *= 0.95
-        self.rotation = np.clip(self.rotation, -45, 45)
-        
-        # Ground collision
+
+        # angular updates (apply control inputs as angular velocities)
+        self.ang_vel[0] = self.input_roll * ROLL_RATE    # deg/s
+        self.ang_vel[2] = self.input_pitch * PITCH_RATE
+        self.ang_vel[1] += self.input_yaw * YAW_RATE * dt   # yaw integrates slowly when input
+
+        # integrate rot (degrees)
+        self.rot += self.ang_vel * dt
+        # damping for angular motion
+        self.ang_vel *= ANGULAR_DAMPING
+
+        # prevent sinking below ground
         if self.pos[1] < 0.1:
             self.pos[1] = 0.1
-            self.vel[1] = max(0, self.vel[1])
-        
+            if self.vel[1] < 0:
+                self.vel[1] = 0.0
+
         self.sim_time += dt
 
-# ---------------------
-# 3D Drawing functions
-# ---------------------
-def draw_grid(size=20, step=2):
-    glColor3f(0.25, 0.35, 0.4)
-    glBegin(GL_LINES)
-    for i in range(-size, size + 1, step):
-        glVertex3f(i, 0, -size)
-        glVertex3f(i, 0, size)
-        glVertex3f(-size, 0, i)
-        glVertex3f(size, 0, i)
-    glEnd()
+# -------------------- Camera Orbit (Option B) --------------------
+class OrbitCamera:
+    def __init__(self, target=None):
+        self.target = target
+        self.dist = CAM_DEFAULT_DIST
+        self.pitch = 20.0
+        self.yaw = 45.0
+        self.orbiting = True
+        self.last_mouse = None
+        self.dragging = False
 
-def draw_ground(size=60):
-    glPushMatrix()
-    glColor3f(0.07, 0.18, 0.15)
-    glBegin(GL_QUADS)
-    glVertex3f(-size, 0, -size)
-    glVertex3f(size, 0, -size)
-    glVertex3f(size, 0, size)
-    glVertex3f(-size, 0, size)
-    glEnd()
-    glPopMatrix()
+    def handle_mouse(self, event):
+        if event.type == MOUSEBUTTONDOWN:
+            if event.button == 1:  # left click to drag orbit
+                self.dragging = True
+                self.last_mouse = pygame.mouse.get_pos()
+        elif event.type == MOUSEBUTTONUP:
+            if event.button == 1:
+                self.dragging = False
+                self.last_mouse = None
+        elif event.type == MOUSEWHEEL:
+            # zoom with wheel
+            self.dist = np.clip(self.dist - event.y * 0.8, CAM_MIN_DIST, CAM_MAX_DIST)
 
-def draw_axes():
-    glLineWidth(3)
-    glBegin(GL_LINES)
-    # X axis - Red
-    glColor3f(1, 0, 0)
-    glVertex3f(0, 0, 0)
-    glVertex3f(2, 0, 0)
-    # Y axis - Green
-    glColor3f(0, 1, 0)
-    glVertex3f(0, 0, 0)
-    glVertex3f(0, 2, 0)
-    # Z axis - Blue
-    glColor3f(0, 0, 1)
-    glVertex3f(0, 0, 0)
-    glVertex3f(0, 0, 2)
-    glEnd()
-    glLineWidth(1)
+    def update_with_keys(self, keys):
+        # arrow keys rotate camera smoothly
+        if keys[K_LEFT]:
+            self.yaw -= 1.8
+        if keys[K_RIGHT]:
+            self.yaw += 1.8
+        if keys[K_UP]:
+            self.pitch = np.clip(self.pitch + 1.2, CAM_MIN_PITCH, CAM_MAX_PITCH)
+        if keys[K_DOWN]:
+            self.pitch = np.clip(self.pitch - 1.2, CAM_MIN_PITCH, CAM_MAX_PITCH)
+        # +/- zoom
+        if keys[K_EQUALS] or keys[K_PLUS]:
+            self.dist = max(CAM_MIN_DIST, self.dist - 0.5)
+        if keys[K_MINUS]:
+            self.dist = min(CAM_MAX_DIST, self.dist + 0.5)
 
-def draw_drone(drone):
-    glPushMatrix()
-    glTranslatef(drone.pos[0], drone.pos[1], drone.pos[2])
-    glRotatef(drone.rotation[1], 0, 1, 0)  # yaw
-    glRotatef(drone.rotation[0], 1, 0, 0)  # roll
-    glRotatef(drone.rotation[2], 0, 0, 1)  # pitch
-    
-    # Drone body color based on battery
-    battery_pct = drone.battery_wh / BATTERY_WH if not UNLIMITED_BATTERY else 1.0
-    glColor3f(0.15 + 0.4 * battery_pct, 0.15, 0.2 + 0.6 * battery_pct)
-    
-    # Body (box)
-    glBegin(GL_QUADS)
-    # Top
-    glVertex3f(-0.14, 0.03, -0.14)
-    glVertex3f(0.14, 0.03, -0.14)
-    glVertex3f(0.14, 0.03, 0.14)
-    glVertex3f(-0.14, 0.03, 0.14)
-    # Bottom
-    glVertex3f(-0.12, -0.03, -0.12)
-    glVertex3f(0.12, -0.03, -0.12)
-    glVertex3f(0.12, -0.03, 0.12)
-    glVertex3f(-0.12, -0.03, 0.12)
-    # Sides
-    glVertex3f(-0.12, -0.03, -0.12)
-    glVertex3f(-0.12, 0.03, -0.12)
-    glVertex3f(-0.12, 0.03, 0.12)
-    glVertex3f(-0.12, -0.03, 0.12)
-    
-    glVertex3f(0.12, -0.03, -0.12)
-    glVertex3f(0.12, 0.03, -0.12)
-    glVertex3f(0.12, 0.03, 0.12)
-    glVertex3f(0.12, -0.03, 0.12)
-    glEnd()
-    
-    # Draw arms and rotors
-    for rotor in drone.rotors:
-        # Arm
-        glColor3f(0.6, 0.6, 0.65)
-        glBegin(GL_QUADS)
-        glVertex3f(0, -0.01, 0)
-        glVertex3f(rotor[0], -0.01, rotor[2])
-        glVertex3f(rotor[0], 0.01, rotor[2])
-        glVertex3f(0, 0.01, 0)
-        glEnd()
-        
-        # Rotor (circle)
-        glPushMatrix()
-        glTranslatef(rotor[0], rotor[1], rotor[2])
-        glColor3f(0.9, 0.3, 0.2)
-        
-        # Draw rotor disc
-        glBegin(GL_TRIANGLE_FAN)
-        glVertex3f(0, 0, 0)
-        for angle in range(0, 361, 30):
-            rad = np.radians(angle)
-            glVertex3f(0.06 * np.cos(rad), 0, 0.06 * np.sin(rad))
-        glEnd()
-        glPopMatrix()
-    
-    glPopMatrix()
+    def process_mouse_drag(self):
+        if self.dragging and self.last_mouse is not None:
+            x, y = pygame.mouse.get_pos()
+            lx, ly = self.last_mouse
+            dx = x - lx
+            dy = y - ly
+            self.yaw += dx * CAM_SENS_X
+            self.pitch -= dy * CAM_SENS_Y
+            self.pitch = np.clip(self.pitch, CAM_MIN_PITCH, CAM_MAX_PITCH)
+            self.last_mouse = (x, y)
 
-def draw_wind_indicator(wind, pos=(15, 0, 0)):
-    glPushMatrix()
-    glTranslatef(pos[0], pos[1] + 2, pos[2])
-    
-    # Arrow shaft
-    glColor3f(0.5, 1.0, 0.5)
-    glLineWidth(3)
-    glBegin(GL_LINES)
-    glVertex3f(0, 0, 0)
-    glVertex3f(wind[0] * 0.5, wind[1] * 0.5, wind[2] * 0.5)
-    glEnd()
-    
-    # Arrow head
-    glTranslatef(wind[0] * 0.5, wind[1] * 0.5, wind[2] * 0.5)
-    glColor3f(0.3, 0.8, 0.3)
-    glBegin(GL_TRIANGLES)
-    glVertex3f(0, 0, 0)
-    glVertex3f(-0.2, 0, -0.1)
-    glVertex3f(-0.2, 0, 0.1)
-    glEnd()
-    
-    glPopMatrix()
-    glLineWidth(1)
+    def apply_view(self):
+        if self.target is None:
+            center = np.array([0.0, 0.0, 0.0])
+        else:
+            center = np.array(self.target.pos, dtype=np.float64)
 
-def blit_text_surface(text_surface, x, y):
-    """Draw a pygame surface as 2D overlay via glDrawPixels."""
-    if text_surface is None:
-        return
-    surface = text_surface.convert_alpha()
-    text_data = pygame.image.tostring(surface, "RGBA", True)
-    width, height = surface.get_size()
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-    glRasterPos2f(x, y)
-    glDrawPixels(width, height, GL_RGBA, GL_UNSIGNED_BYTE, text_data)
+        # spherical coords
+        rad_pitch = math.radians(self.pitch)
+        rad_yaw = math.radians(self.yaw)
+        x = center[0] + self.dist * math.cos(rad_pitch) * math.sin(rad_yaw)
+        y = center[1] + self.dist * math.sin(rad_pitch)
+        z = center[2] + self.dist * math.cos(rad_pitch) * math.cos(rad_yaw)
 
-def draw_overlay_panel(x, y, width, height, color=(0, 0, 0, 0.5)):
-    """Draw semi-transparent rectangle for HUD backgrounds."""
-    glColor4f(*color)
-    glBegin(GL_QUADS)
-    glVertex2f(x, y)
-    glVertex2f(x + width, y)
-    glVertex2f(x + width, y + height)
-    glVertex2f(x, y + height)
-    glEnd()
+        gluLookAt(x, y, z, center[0], center[1], center[2], 0, 1, 0)
 
-# ---------------------
-# Initialize Pygame + OpenGL
-# ---------------------
-def main():
-    global camera_distance, camera_angle_x, camera_angle_y, camera_follow
-    
-    pygame.init()
-    display = (1400, 900)
-    pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("3D Drone Climate Simulation")
-    
-    # OpenGL setup
-    glClearColor(0.04, 0.06, 0.1, 1.0)
+# -------------------- HUD Helper --------------------
+class HUD:
+    def __init__(self, width, height):
+        pygame.font.init()
+        self.font = pygame.font.Font(None, 24)
+        self.small = pygame.font.Font(None, 18)
+        self.width = width
+        self.height = height
+        self.last_surface = None
+        self.last_key = None
+
+    def render(self, drone, wind, camera):
+        texts = [
+            f"Time: {drone.sim_time:.1f}s",
+            f"Altitude: {drone.pos[1]:.2f} m",
+            f"Throttle: {drone.throttle:.2f}",
+            f"Position: ({drone.pos[0]:.2f}, {drone.pos[1]:.2f}, {drone.pos[2]:.2f})",
+            f"Velocity: ({drone.vel[0]:.2f}, {drone.vel[1]:.2f}, {drone.vel[2]:.2f})",
+            f"Wind: ({wind[0]:.1f}, {wind[1]:.1f}, {wind[2]:.1f}) m/s",
+            f"Camera dist: {camera.dist:.1f}, pitch: {camera.pitch:.1f}, yaw: {camera.yaw:.1f}",
+        ]
+        controls = [
+            "CONTROLS:",
+            "Enter : Toggle Flight | Space/Shift : Throttle Up/Down",
+            "W/S : Pitch forward/back | A/D : Roll left/right | Q/E : Yaw left/right",
+            "Mouse drag (left) or Arrow keys : Orbit camera",
+            "+/- : Zoom | R : Reset | F : Toggle follow",
+            "J/L / I/K / U/O : change wind X/Z/Y"
+        ]
+
+        # create surface
+        surf_w = 420
+        surf_h = max(220, 24 * (len(texts) + len(controls)))
+        surf = pygame.Surface((surf_w, surf_h), pygame.SRCALPHA)
+        surf.fill((10, 10, 10, HUD_BG_ALPHA))
+
+        y = 8
+        for t in texts:
+            txt = self.font.render(t, True, (230, 230, 230))
+            surf.blit(txt, (8, y))
+            y += 26
+
+        y += 6
+        for t in controls:
+            txt = self.small.render(t, True, (200, 220, 255))
+            surf.blit(txt, (8, y))
+            y += 20
+
+        return surf
+
+# -------------------- Utility functions --------------------
+def init_opengl(width, height):
     glEnable(GL_DEPTH_TEST)
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_CULL_FACE)
+    glCullFace(GL_BACK)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glLightfv(GL_LIGHT0, GL_POSITION, (5.0, 8.0, 6.0, 1.0))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, (0.95, 0.95, 0.95, 1.0))
+    glLightfv(GL_LIGHT0, GL_AMBIENT, (0.2, 0.2, 0.2, 1.0))
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    glShadeModel(GL_SMOOTH)
     glMatrixMode(GL_PROJECTION)
-    gluPerspective(45, (display[0] / display[1]), 0.1, 100.0)
+    glLoadIdentity()
+    gluPerspective(45, width / float(height), 0.1, 500.0)
     glMatrixMode(GL_MODELVIEW)
-    
-    # Font for HUD
-    font = pygame.font.Font(None, 24)
-    small_font = pygame.font.Font(None, 20)
-    
-    # Initialize
-    drone = Drone()
-    steady_wind = DEFAULT_WIND.copy()
-    gust_enabled = False
-    drone_active = False
-    
+
+# -------------------- Main --------------------
+def main():
+    pygame.init()
+    pygame.display.set_caption("3D Drone Simulation — Orbit Camera (B)")
+
+    screen = pygame.display.set_mode(DISPLAY, DOUBLEBUF | OPENGL)
+    init_opengl(DISPLAY[0], DISPLAY[1])
     clock = pygame.time.Clock()
+
+    # load model (if present)
+    use_obj = os.path.exists(MODEL_PATH)
+    if use_obj:
+        try:
+            obj_model = SimpleOBJ(MODEL_PATH)
+        except Exception as e:
+            print("[ERROR] loading OBJ:", e)
+            use_obj = False
+            obj_model = None
+    else:
+        obj_model = None
+        print("[INFO] OBJ not found, will use dummy if necessary.")
+
+    drone = Drone()
+    camera = OrbitCamera(target=drone)
+    hud = HUD(DISPLAY[0], DISPLAY[1])
+
     running = True
-    mouse_down = False
-    last_mouse_pos = None
-    
-    print("=" * 60)
-    print("3D DRONE CLIMATE SIMULATION")
-    print("=" * 60)
-    print("FLIGHT CONTROLS:")
-    print("  ENTER: Toggle motors on/off")
-    print("  W/S: Pitch forward/backward")
-    print("  A/D: Roll left/right")
-    print("  Q/E: Yaw left/right")
-    print("  SPACE / SHIFT: Throttle up/down")
-    print()
-    print("CAMERA CONTROLS:")
-    print("  Arrow Keys: Rotate camera")
-    print("  +/-: Zoom in/out")
-    print("  F: Toggle follow mode")
-    print()
-    print("OTHER:")
-    print("  R: Reset simulation")
-    print("  G: Toggle gusts")
-    print("  Wind adjust: J/L (X axis), I/K (Z axis), U/O (Y axis)")
-    print("  ESC: Quit")
-    print("=" * 60)
-    
+    drone_active = False
+    gust_enabled = False
+    steady_wind = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    last_hud_time = 0.0
+
+    # initial mouse capture state: allow dragging orbit by left button
+    pygame.event.set_grab(False)
+    pygame.mouse.set_visible(True)
+
+    # precompute a simple grid geometry? we draw immediate (cheap)
     while running:
         dt = TIME_STEP
-        
-        # Event handling
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            if event.type == QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+            camera.handle_mouse(event)
+
+            if event.type == KEYDOWN:
+                if event.key == K_ESCAPE:
                     running = False
-                elif event.key == pygame.K_r:
-                    drone = Drone()
-                    drone_active = False
-                    steady_wind = DEFAULT_WIND.copy()
-                elif event.key == pygame.K_f:
-                    camera_follow = not camera_follow
-                elif event.key == pygame.K_g:
-                    gust_enabled = not gust_enabled
-                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
-                    camera_distance = max(3, camera_distance - 1)
-                elif event.key == pygame.K_MINUS:
-                    camera_distance = min(30, camera_distance + 1)
-                elif event.key == pygame.K_RETURN:
+                elif event.key == K_RETURN:
                     drone_active = not drone_active
-                    if not drone_active:
-                        drone.throttle = 0.0
-                        drone.roll_input = 0.0
-                        drone.pitch_input = 0.0
-                        drone.yaw_input = 0.0
-                        drone.vel[:] = 0.0
-                elif event.key == pygame.K_BACKSPACE:
+                elif event.key == K_r:
+                    # reset
+                    drone = Drone()
+                    camera.target = drone
                     drone_active = False
-                    drone.throttle = 0.0
-                    drone.roll_input = 0.0
-                    drone.pitch_input = 0.0
-                    drone.yaw_input = 0.0
-                    drone.vel[:] = 0.0
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:  # Left click
-                    mouse_down = True
-                    last_mouse_pos = pygame.mouse.get_pos()
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 1:
-                    mouse_down = False
-            elif event.type == pygame.MOUSEMOTION:
-                if mouse_down and last_mouse_pos:
-                    dx = event.pos[0] - last_mouse_pos[0]
-                    dy = event.pos[1] - last_mouse_pos[1]
-                    camera_angle_y += dx * 0.5
-                    camera_angle_x += dy * 0.5
-                    camera_angle_x = np.clip(camera_angle_x, -89, 89)
-                    last_mouse_pos = event.pos
-        
-        # Keyboard controls
+                    steady_wind = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+                elif event.key == K_f:
+                    # toggle follow mode (we keep orbit but camera target remains drone)
+                    camera.target = drone
+                elif event.key == K_g:
+                    gust_enabled = not gust_enabled
+                # wind adjustments
+                elif event.key == K_j:
+                    steady_wind[0] -= 0.5
+                elif event.key == K_l:
+                    steady_wind[0] += 0.5
+                elif event.key == K_i:
+                    steady_wind[2] += 0.5
+                elif event.key == K_k:
+                    steady_wind[2] -= 0.5
+                elif event.key == K_u:
+                    steady_wind[1] += 0.3
+                elif event.key == K_o:
+                    steady_wind[1] -= 0.3
+
+            elif event.type == MOUSEMOTION:
+                # allow camera drag when left button held
+                if pygame.mouse.get_pressed()[0]:
+                    camera.process_mouse_drag()
+
+            elif event.type == MOUSEWHEEL:
+                camera.handle_mouse(event)
+
         keys = pygame.key.get_pressed()
-        
-        # Throttle
-        if keys[pygame.K_SPACE]:
+
+        # Camera keyboard adjustments
+        camera.update_with_keys(keys)
+
+        # Flight control mapping (smooth)
+        # throttle up / down
+        if keys[K_SPACE]:
             drone.throttle = min(1.0, drone.throttle + THROTTLE_STEP)
-        elif keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
-            drone.throttle = max(0.0, drone.throttle - THROTTLE_STEP)
-
-        # Direct axis controls for better responsiveness
-        pitch_axis = 0.0
-        if keys[pygame.K_w]:
-            pitch_axis += 1.0
-        if keys[pygame.K_s]:
-            pitch_axis -= 1.0
-        drone.pitch_input = pitch_axis if drone_active else 0.0
-
-        roll_axis = 0.0
-        if keys[pygame.K_d]:
-            roll_axis += 1.0
-        if keys[pygame.K_a]:
-            roll_axis -= 1.0
-        drone.roll_input = roll_axis if drone_active else 0.0
-
-        yaw_axis = 0.0
-        if keys[pygame.K_e]:
-            yaw_axis += 1.0
-        if keys[pygame.K_q]:
-            yaw_axis -= 1.0
-        drone.yaw_input = yaw_axis if drone_active else 0.0
-
-        # Wind controls (I/K = forward/back (Z), J/L = left/right (X), U/O = up/down (Y))
-        wind_delta = np.zeros(3)
-        if keys[pygame.K_j]:
-            wind_delta[0] -= WIND_STEP
-        if keys[pygame.K_l]:
-            wind_delta[0] += WIND_STEP
-        if keys[pygame.K_i]:
-            wind_delta[2] += WIND_STEP
-        if keys[pygame.K_k]:
-            wind_delta[2] -= WIND_STEP
-        if keys[pygame.K_u]:
-            wind_delta[1] += WIND_STEP
-        if keys[pygame.K_o]:
-            wind_delta[1] -= WIND_STEP
-        if np.any(wind_delta):
-            steady_wind = np.clip(steady_wind + wind_delta,
-                                  -MAX_WIND_SPEED,
-                                  MAX_WIND_SPEED)
-        
-        # Camera controls (arrow keys)
-        if keys[pygame.K_LEFT]:
-            camera_angle_y -= 2
-        if keys[pygame.K_RIGHT]:
-            camera_angle_y += 2
-        if keys[pygame.K_UP]:
-            camera_angle_x = min(89, camera_angle_x + 2)
-        if keys[pygame.K_DOWN]:
-            camera_angle_x = max(-89, camera_angle_x - 2)
-        
-        # Update drone only when active
-        if drone_active:
-            drone.update(dt, steady_wind, gust_enabled)
         else:
-            drone.vel *= 0.98
-        
-        # Clear screen
+            # gentle decay so drone gently descends if not holding throttle, but allow hover with small thrust
+            drone.throttle *= THROTTLE_DECAY
+
+        if keys[K_LSHIFT] or keys[K_RSHIFT]:
+            drone.throttle = max(0.0, drone.throttle - THROTTLE_STEP * 1.5)
+
+        # pitch/roll from W A S D (centered when not pressed)
+        pitch_in = 0.0
+        if keys[K_a]:      # A now moves forward (pitch forward)
+            pitch_in += 1.0
+        if keys[K_d]:      # D now moves backward (pitch backward)
+            pitch_in -= 1.0
+
+        roll_in = 0.0
+        if keys[K_w]:      # W now tilts left (roll left)
+            roll_in -= 1.0
+        if keys[K_s]:      # S now tilts right (roll right)
+            roll_in += 1.0
+
+        yaw_in = 0.0
+        if keys[K_e]:
+            yaw_in += 1.0
+        if keys[K_q]:
+            yaw_in -= 1.0
+
+        # map inputs into drone smooth inputs (scale)
+        drone.input_pitch = float(pitch_in) * 0.9
+        drone.input_roll = float(roll_in) * 0.9
+        drone.input_yaw = float(yaw_in) * 0.6
+
+        # gusts: occasional random spike when enabled
+        wind = steady_wind.copy()
+        if gust_enabled and np.random.rand() < 0.01:
+            wind += np.random.normal(scale=1.5, size=3)
+
+        # small wind influence on drone velocity (for effect)
+        # we incorporate wind by adding small velocity bias; keep stable
+        drone.vel += 0.01 * wind * dt
+
+        # Update drone physics
+        drone.update(dt)
+
+        # Clamp positions to avoid runaway (optional safety)
+        if np.any(np.abs(drone.pos) > 1000):
+            drone.pos = np.array([0.0, 2.5, 0.0], dtype=np.float64)
+            drone.vel[:] = 0.0
+
+        # Render pass
+        glClearColor(0.04, 0.06, 0.10, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
-        
-        # Camera positioning
-        if camera_follow:
-            # Follow drone
-            camera_x = drone.pos[0] + camera_distance * np.sin(np.radians(camera_angle_y)) * np.cos(np.radians(camera_angle_x))
-            camera_y = drone.pos[1] + camera_distance * np.sin(np.radians(camera_angle_x))
-            camera_z = drone.pos[2] + camera_distance * np.cos(np.radians(camera_angle_y)) * np.cos(np.radians(camera_angle_x))
-            gluLookAt(camera_x, camera_y, camera_z,
-                     drone.pos[0], drone.pos[1], drone.pos[2],
-                     0, 1, 0)
+
+        # camera apply (orbit)
+        camera.apply_view()
+
+        # draw ground and grid
+        # ground quad
+        glPushMatrix()
+        draw_ground = True
+        if draw_ground:
+            glDisable(GL_LIGHTING)
+            glColor3f(0.07, 0.12, 0.15)
+            glBegin(GL_QUADS)
+            size = 80
+            glVertex3f(-size, 0.0, -size)
+            glVertex3f(size, 0.0, -size)
+            glVertex3f(size, 0.0, size)
+            glVertex3f(-size, 0.0, size)
+            glEnd()
+            glEnable(GL_LIGHTING)
+
+        # grid
+        glDisable(GL_LIGHTING)
+        glColor3f(0.25, 0.35, 0.45)
+        glBegin(GL_LINES)
+        for i in range(-40, 41, 2):
+            glVertex3f(i, 0.01, -40)
+            glVertex3f(i, 0.01, 40)
+            glVertex3f(-40, 0.01, i)
+            glVertex3f(40, 0.01, i)
+        glEnd()
+        glEnable(GL_LIGHTING)
+        glPopMatrix()
+
+        # draw drone (obj if available else simple fallback)
+        if use_obj and obj_model is not None:
+            glPushMatrix()
+            # position + orientation (match SimpleOBJ drawn size)
+            glTranslatef(drone.pos[0], drone.pos[1], drone.pos[2])
+            # apply yaw, roll, pitch order (match physics)
+            glRotatef(drone.rot[1], 0, 1, 0)   # yaw
+            glRotatef(drone.rot[0], 1, 0, 0)   # roll
+            glRotatef(drone.rot[2], 0, 0, 1)   # pitch
+            # scale tweak to make sure visible
+            glScalef(1.0, 1.0, 1.0)
+            obj_model.draw()
+            glPopMatrix()
         else:
-            # Fixed camera
-            camera_x = camera_distance * np.sin(np.radians(camera_angle_y)) * np.cos(np.radians(camera_angle_x))
-            camera_y = camera_distance * np.sin(np.radians(camera_angle_x))
-            camera_z = camera_distance * np.cos(np.radians(camera_angle_y)) * np.cos(np.radians(camera_angle_x))
-            gluLookAt(camera_x, camera_y, camera_z, 0, 2, 0, 0, 1, 0)
-        
-        # Draw scene
-        draw_ground()
-        draw_grid()
-        draw_drone(drone)
-        draw_wind_indicator(steady_wind)
-        
-        # Render HUD using Pygame
+            # fallback simple cube drone
+            glPushMatrix()
+            glTranslatef(drone.pos[0], drone.pos[1], drone.pos[2])
+            glRotatef(drone.rot[1], 0, 1, 0)
+            glRotatef(drone.rot[0], 1, 0, 0)
+            glRotatef(drone.rot[2], 0, 0, 1)
+            glColor3f(0.2, 0.5, 1.0)
+            glScalef(0.4, 0.12, 0.4)
+            # cube
+            glut_box = False
+            if glut_box:
+                from OpenGL.GLUT import glutSolidCube
+                glutSolidCube(1.0)
+            else:
+                # simple quad-body
+                glBegin(GL_QUADS)
+                # top
+                glVertex3f(-0.5, 0.5, -0.5)
+                glVertex3f(0.5, 0.5, -0.5)
+                glVertex3f(0.5, 0.5, 0.5)
+                glVertex3f(-0.5, 0.5, 0.5)
+                # bottom
+                glVertex3f(-0.5, -0.5, -0.5)
+                glVertex3f(0.5, -0.5, -0.5)
+                glVertex3f(0.5, -0.5, 0.5)
+                glVertex3f(-0.5, -0.5, 0.5)
+                # sides...
+                glEnd()
+            glPopMatrix()
+
+        # HUD: render via pygame surface then draw using glDrawPixels
+        hud_surface = hud.render(drone, steady_wind, camera)
+        hud_data = pygame.image.tostring(hud_surface, "RGBA", True)
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
-        glOrtho(0, display[0], display[1], 0, -1, 1)
+        glOrtho(0, DISPLAY[0], DISPLAY[1], 0, -1, 1)
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
         glLoadIdentity()
         glDisable(GL_DEPTH_TEST)
-        
-        # Create text surfaces
-        if UNLIMITED_BATTERY:
-            battery_pct = 100.0
-            battery_line = "Battery: ∞ (Unlimited)"
-        else:
-            battery_pct = (drone.battery_wh / BATTERY_WH) * 100
-            battery_line = f"Battery: {battery_pct:.1f}% ({drone.battery_wh:.2f}Wh)"
-        texts = [
-            f"Time: {drone.sim_time:.1f}s",
-            f"Altitude: {drone.pos[1]:.2f}m",
-            f"Position: ({drone.pos[0]:.1f}, {drone.pos[1]:.1f}, {drone.pos[2]:.1f})",
-            f"Throttle: {drone.throttle:.2f}",
-            battery_line,
-            f"Wind: ({steady_wind[0]:.1f}, {steady_wind[1]:.1f}, {steady_wind[2]:.1f}) m/s",
-            f"Gusts: {'ON' if gust_enabled else 'OFF'}",
-            f"Camera: {'FOLLOW' if camera_follow else 'FIXED'}",
-            f"Flight: {'ACTIVE' if drone_active else 'PAUSED'}",
-        ]
-        panel_height = len(texts) * 25 + 20
-        draw_overlay_panel(5, 5, 360, panel_height)
-
-        # Draw text (convert to OpenGL texture)
-        y = 10
-        for text in texts:
-            color = (255, 255, 255) if battery_pct > 20 else (255, 100, 100)
-            text_surface = small_font.render(text, True, color)
-            blit_text_surface(text_surface, 10, y)
-            y += 25
-
-        # Battery warning (only if finite battery)
-        if not UNLIMITED_BATTERY and battery_pct < 20:
-            warning = font.render("⚠ LOW BATTERY ⚠", True, (255, 50, 50))
-            blit_text_surface(warning, display[0]//2 - 100, 30)
-
-        # Controls legend on the right-hand side
-        control_lines = [
-            "BASIC CONTROLS",
-            "Enter : start / pause",
-            "Space / Shift : up / down",
-            "W S : forward / back tilt",
-            "A D : left / right tilt",
-            "Q E : yaw rotate",
-            "Arrow keys : camera orbit",
-            "+ / - : zoom , F : follow cam",
-            "Wind axes : J L / I K / U O",
-            "R : reset scene",
-            "ESC : quit",
-        ]
-        panel_height_controls = len(control_lines) * 22 + 20
-        x = display[0] - 340
-        draw_overlay_panel(x - 5, 5, 335, panel_height_controls)
-        y = 10
-        for line in control_lines:
-            text_surface = small_font.render(line, True, (200, 220, 255))
-            blit_text_surface(text_surface, x, y)
-            y += 22
-
-        if not drone_active:
-            stop_msg = font.render("DRONE PAUSED - PRESS ENTER TO FLY", True, (255, 255, 255))
-            sub_msg = small_font.render("Set throttle with Space / Shift, ESC to exit", True, (200, 200, 200))
-            panel_w = max(stop_msg.get_width(), sub_msg.get_width()) + 40
-            panel_h = stop_msg.get_height() + sub_msg.get_height() + 30
-            panel_x = (display[0] - panel_w) / 2
-            panel_y = display[1] - panel_h - 40
-            draw_overlay_panel(panel_x, panel_y, panel_w, panel_h, (0.1, 0.1, 0.1, 0.75))
-            blit_text_surface(stop_msg, panel_x + 20, panel_y + 10)
-            blit_text_surface(sub_msg, panel_x + 20, panel_y + 20 + stop_msg.get_height())
-        
+        glRasterPos2i(8, 8 + hud_surface.get_height())   # draw top-left
+        glDrawPixels(hud_surface.get_width(), hud_surface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, hud_data)
         glEnable(GL_DEPTH_TEST)
+        glPopMatrix()
         glMatrixMode(GL_PROJECTION)
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
-        glPopMatrix()
-        
+
         pygame.display.flip()
-        clock.tick(60)
-    
+        clock.tick(FPS_TARGET)
+
     pygame.quit()
     sys.exit()
 
